@@ -8,17 +8,14 @@ from rest_framework.permissions import IsAuthenticated
 from sentry import status_checks
 from sentry.status_checks import sort_by_severity
 from sentry.api.base import Endpoint
-from sentry.auth.superuser import is_active_superuser
+from sentry.api.bases.organization import OrganizationPermission
 from sentry.utils.hashlib import md5_text
 
 
 class SystemHealthEndpoint(Endpoint):
-    permission_classes = (IsAuthenticated, )
+    permission_classes = (OrganizationPermission, )
 
     def get(self, request):
-        if not is_active_superuser(request):
-            return Response()
-
         results = status_checks.check_all()
         return Response(
             {

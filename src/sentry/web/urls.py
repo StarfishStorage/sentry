@@ -107,6 +107,11 @@ urlpatterns += patterns(
         name='sentry-api-store'
     ),
     url(
+        r'^api/0/progress/(?P<key>[\w_\-\:\']+)/$',
+        api.ProgressView.as_view(),
+        name='sentry-api-progress'
+    ),
+    url(
         r'^api/(?P<project_id>[\w_-]+)/minidump/?$',
         api.MinidumpView.as_view(),
         name='sentry-api-minidump'

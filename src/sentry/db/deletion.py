@@ -2,19 +2,21 @@ from __future__ import absolute_import
 
 from datetime import timedelta
 from django.db import connections, router
+from django.db.models import FieldDoesNotExist
 from django.utils import timezone
 
 from sentry.utils import db
 
 
 class BulkDeleteQuery(object):
-    def __init__(self, model, project_id=None, dtfield=None, days=None, order_by=None):
+    def __init__(self, model, project_id=None, dtfield=None, days=None, order_by=None, group_id=None):
         self.model = model
         self.project_id = int(project_id) if project_id else None
         self.dtfield = dtfield
         self.days = int(days) if days is not None else None
         self.order_by = order_by
         self.using = router.db_for_write(model)
+        self.group_id = group_id
 
     def execute_postgres(self, chunk_size=10000):
         quote_name = connections[self.using].ops.quote_name
@@ -30,6 +32,17 @@ class BulkDeleteQuery(object):
             )
         if self.project_id:
             where.append("project_id = {}".format(self.project_id))
+
+        if self.group_id:
+            field = None
+            for field_name in ['group', 'group_id']:
+                try:
+                    field = self.model._meta.get_field(field_name)
+                    break
+                except FieldDoesNotExist:
+                    pass
+            if field:
+                where.append("group_id = {}".format(self.group_id))
 
         if where:
             where_clause = 'where {}'.format(' and '.join(where))
@@ -109,6 +122,10 @@ class BulkDeleteQuery(object):
                 qs = qs.filter(project=self.project_id)
             else:
                 qs = qs.filter(project_id=self.project_id)
+        if self.group_id:
+            fields = self.model._meta.get_all_field_names()
+            if 'group' in fields or 'group_id' in fields:
+                qs = qs.filter(group_id=self.group_id)
 
         return self._continuous_generic_query(qs, chunk_size)
 

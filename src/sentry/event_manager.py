@@ -9,10 +9,14 @@ from __future__ import absolute_import, print_function
 import logging
 import math
 import re
+from contextlib import closing
+import time
+
 import six
 
+from redis import StrictRedis
 from datetime import datetime, timedelta
-from collections import OrderedDict
+from collections import OrderedDict, defaultdict
 from django.conf import settings
 from django.db import connection, IntegrityError, router, transaction
 from django.utils import timezone
@@ -20,6 +24,9 @@ from django.utils.encoding import force_bytes, force_text
 from hashlib import md5
 from uuid import uuid4
 
+from sentry.utils.compat import pickle
+from sentry.utils.strings import compress
+from sentry import tagstore
 from sentry import buffer, eventtypes, features, tsdb
 from sentry.constants import (
     CLIENT_RESERVED_ATTRS, LOG_LEVELS, LOG_LEVELS_MAP, DEFAULT_LOG_LEVEL,
@@ -37,7 +44,6 @@ from sentry.models import (
 from sentry.plugins import plugins
 from sentry.signals import event_discarded, event_saved, first_event_received
 from sentry.tasks.merge import merge_group
-from sentry.tasks.post_process import post_process_group
 from sentry.utils import metrics
 from sentry.utils.cache import default_cache
 from sentry.utils.db import get_db_engine
@@ -45,6 +51,7 @@ from sentry.utils.safe import safe_execute, trim, trim_dict, get_path
 from sentry.utils.strings import truncatechars
 from sentry.utils.validators import is_float
 from sentry.stacktraces import normalize_in_app
+from sentry.tagstore.legacy.models.eventtag import EventTag
 
 
 HASH_RE = re.compile(r'^[0-9a-f]{32}$')
@@ -305,6 +312,64 @@ class InvalidTimestamp(Exception):
     pass
 
 
+
+class PgCopier(object):
+    """
+    WARNING: This class creates string from all rows and keeps it in memory.
+    Passing millions of rows is not recommended.
+    If need arise it could be changed to use temporary file.
+    """
+
+    PG_COPY_NULL_INDICATOR = '\\N'  # String representing Null value
+    PG_COPY_JOIN_COLUMS_CHAR = '\t'
+    PG_COPY_JOIN_ROWS_CHAR = '\n'
+    PG_COPY_ESCAPE_DICT = OrderedDict([
+        ("\\", "\\\\"),
+        ("\n", "\\\n"),
+        ("\t", "\\\t"),
+        ("\r", "\\\r")
+    ])
+    PG_COPY_ESCAPE_REGEX = re.compile('|'.join(map(re.escape, PG_COPY_ESCAPE_DICT.keys())))
+
+    def __init__(self, table_name, raw_pg_conn):
+        self._table_name = table_name
+        self._raw_pg_conn = raw_pg_conn
+
+    @staticmethod
+    def escaped_string(event_dict_value):
+        r"""
+        Function replaces escapes special characters no allowed by PG copy
+        >>> PgCopier.escaped_string('String with \n and \r and \t inside')
+        'String with \\\n and \\\r and \\\t inside'
+        >>> PgCopier.escaped_string(None)
+        '\\N'
+        >>> PgCopier.escaped_string(PgCopier.PG_COPY_NULL_INDICATOR) != PgCopier.PG_COPY_NULL_INDICATOR
+        True
+        """
+        if event_dict_value is None:
+            return PgCopier.PG_COPY_NULL_INDICATOR
+        if isinstance(event_dict_value, six.string_types):
+            return PgCopier.PG_COPY_ESCAPE_REGEX.sub(
+                lambda match: PgCopier.PG_COPY_ESCAPE_DICT[match.group(0)], event_dict_value)
+        else:
+            return str(event_dict_value)
+
+    def _row_to_string(self, row):
+        return self.PG_COPY_JOIN_COLUMS_CHAR.join(self.escaped_string(coll) for coll in row)
+
+    def copy_from_tuples(self, rows, columns):
+        rows_count = 0
+        buff = six.StringIO()
+        for row in rows:
+            buff.write(self._row_to_string(row))
+            buff.write(self.PG_COPY_JOIN_ROWS_CHAR)
+            rows_count += 1  # we can't get len(rows) because it can be generator
+        buff.seek(0)  # set cursor at beginning so it could be read
+
+        with closing(self._raw_pg_conn.cursor()) as cur:
+            cur.copy_from(buff, self._table_name, columns=columns, null=PgCopier.PG_COPY_NULL_INDICATOR)
+
+
 class EventManager(object):
     logger = logging.getLogger('sentry.events')
 
@@ -533,8 +598,90 @@ class EventManager(object):
         return data
 
     def save(self, project, raw=False):
-        from sentry.tasks.post_process import index_event_tags
+        redis_db = StrictRedis.from_url(settings.BROKER_URL)
+        duration_start = time.time()
+        items = self.data
 
+        events = []
+
+        inc_keys = defaultdict(int)
+        count = len(items)
+        for item in items:
+            data = item.copy()
+            events.append(self.save_item(data, project))
+            if 'counter' in data['extra']:
+                inc_keys[data['extra']['counter'].strip("'")] += 1
+
+        now__isoformat = timezone.now().isoformat()
+        tuples = []
+        for event, tags, mapping, environment in events:
+            tuples.append((mapping.project_id, mapping.group.id, mapping.event_id, now__isoformat))
+        copier = PgCopier(EventMapping._meta.db_table, connection)
+        copier.copy_from_tuples(tuples, ['project_id', 'group_id', 'event_id', 'date_added'])
+
+        tuples = []
+        for event, tags, mapping, environment in events:
+            message = event.message.decode("utf-8", errors="backslashreplace").encode("utf-8")
+            tuples.append((message, event.group.id, event.project_id, event.event_id, compress(pickle.dumps(event.data)), event.datetime.isoformat()))
+        copier = PgCopier(Event._meta.db_table, connection)
+        copier.copy_from_tuples(tuples, ['message', 'group_id', 'project_id', 'message_id', 'data', 'datetime'])
+
+        # Get events from db, as some fields are set after events are stored in db
+        db_events = list(Event.objects.filter(event_id__in=[event.event_id for event, tags, mapping, environment in events]))
+        events_map = {event.event_id: event for event in db_events}
+        new_events = []
+        # recreate events list, this time using Event instances from db
+        for event, tags, mapping, environment in events:
+            new_events.append((
+                events_map[event.event_id],
+                tags,
+                mapping,
+                environment
+            ))
+        events = new_events
+
+        keys = set()
+        key_to_tagkey = {}
+        # All events are from the same project
+        event, tags, mapping, environment = events[0]
+        project_id = event.project_id
+        for event, tags, mapping, environment in events:
+            for key, value in tags:
+                keys.add((environment.id, key))
+
+        for key in keys:
+            # This created O(n) queries, can be improved to run constant number of queries on db
+            tagkey, _ = tagstore.get_or_create_tag_key(project_id, *key)
+            key_to_tagkey[key[1]] = tagkey
+
+        event_tags = []
+        for event, tags, mapping, environment in events:
+
+            for key, value in tags:
+                # This created O(n) queries, can be improved to run constant number of queries on db
+                tagvalue, _ = tagstore.get_or_create_tag_value(project_id, environment.id, key, value)
+                event_tags.append(EventTag(
+                    project_id=project_id,
+                    group_id=event.group_id,
+                    event_id=event.id,
+                    key_id=key_to_tagkey[key].id,
+                    value_id=tagvalue.id,
+                ))
+            safe_execute(Group.objects.add_tags, event.group, environment, tags, _with_transaction=False)
+
+        tuples = []
+        for tag in event_tags:
+            tuples.append((tag.project_id, tag.group_id, tag.event_id, tag.key_id, tag.value_id, now__isoformat))
+        copier = PgCopier(EventTag._meta.db_table, connection)
+        copier.copy_from_tuples(tuples, ['project_id', 'group_id', 'event_id', 'key_id', 'value_id', 'date_added'])
+
+        for key, value in inc_keys.items():
+            redis_db.hincrby("loaded", key, value)
+
+        duration_end = time.time()
+        self.logger.info("EVENTS %s PERF: %s" % (count, count / (duration_end - duration_start),))
+
+    def save_item(self, data, project, raw=False):
         project = Project.objects.get_from_cache(id=project)
 
         # Check to make sure we're not about to do a bunch of work that's
@@ -545,7 +692,7 @@ class EventManager(object):
         try:
             event = Event.objects.get(
                 project_id=project.id,
-                event_id=self.data['event_id'],
+                event_id=data['event_id'],
             )
         except Event.DoesNotExist:
             pass
@@ -554,14 +701,12 @@ class EventManager(object):
                 'duplicate.found',
                 exc_info=True,
                 extra={
-                    'event_uuid': self.data['event_id'],
+                    'event_uuid': data['event_id'],
                     'project_id': project.id,
                     'model': Event.__name__,
                 }
             )
             return event
-
-        data = self.data.copy()
 
         # First we pull out our top-level (non-data attr) kwargs
         event_id = data.pop('event_id')
@@ -598,7 +743,6 @@ class EventManager(object):
         date = date.replace(tzinfo=timezone.utc)
 
         kwargs = {
-            'platform': platform,
         }
 
         event = Event(
@@ -614,7 +758,6 @@ class EventManager(object):
         # convert this to a dict to ensure we're only storing one value per key
         # as most parts of Sentry dont currently play well with multiple values
         tags = dict(data.get('tags') or [])
-        tags['level'] = LOG_LEVELS[level]
         if logger_name:
             tags['logger'] = logger_name
         if server_name:
@@ -654,13 +797,6 @@ class EventManager(object):
         # At this point we want to normalize the in_app values in case the
         # clients did not set this appropriately so far.
         normalize_in_app(data)
-
-        for plugin in plugins.for_project(project, version=None):
-            added_tags = safe_execute(plugin.get_tags, event, _with_transaction=False)
-            if added_tags:
-                # plugins should not override user provided tags
-                for key, value in added_tags:
-                    tags.setdefault(key, value)
 
         for path, iface in six.iteritems(event.interfaces):
             for k, v in iface.iter_tags():
@@ -784,192 +920,15 @@ class EventManager(object):
         # store a reference to the group id to guarantee validation of isolation
         event.data.bind_ref(event)
 
-        # When an event was sampled, the canonical source of truth
-        # is the EventMapping table since we aren't going to be writing out an actual
-        # Event row. Otherwise, if the Event isn't being sampled, we can safely
-        # rely on the Event table itself as the source of truth and ignore
-        # EventMapping since it's redundant information.
-        if is_sample:
-            try:
-                with transaction.atomic(using=router.db_for_write(EventMapping)):
-                    EventMapping.objects.create(project=project, group=group, event_id=event_id)
-            except IntegrityError:
-                self.logger.info(
-                    'duplicate.found',
-                    exc_info=True,
-                    extra={
-                        'event_uuid': event_id,
-                        'project_id': project.id,
-                        'group_id': group.id,
-                        'model': EventMapping.__name__,
-                    }
-                )
-                return event
-
         environment = Environment.get_or_create(
             project=project,
             name=environment,
         )
 
-        group_environment, is_new_group_environment = GroupEnvironment.get_or_create(
-            group_id=group.id,
-            environment_id=environment.id,
-            defaults={
-                'first_release_id': release.id if release else None,
-            },
-        )
-
-        if release:
-            ReleaseEnvironment.get_or_create(
-                project=project,
-                release=release,
-                environment=environment,
-                datetime=date,
-            )
-
-            ReleaseProjectEnvironment.get_or_create(
-                project=project,
-                release=release,
-                environment=environment,
-                datetime=date,
-            )
-
-            grouprelease = GroupRelease.get_or_create(
-                group=group,
-                release=release,
-                environment=environment,
-                datetime=date,
-            )
-
-        counters = [
-            (tsdb.models.group, group.id),
-            (tsdb.models.project, project.id),
-        ]
-
-        if release:
-            counters.append((tsdb.models.release, release.id))
-
-        tsdb.incr_multi(counters, timestamp=event.datetime, environment_id=environment.id)
-
-        frequencies = [
-            # (tsdb.models.frequent_projects_by_organization, {
-            #     project.organization_id: {
-            #         project.id: 1,
-            #     },
-            # }),
-            # (tsdb.models.frequent_issues_by_project, {
-            #     project.id: {
-            #         group.id: 1,
-            #     },
-            # })
-            (tsdb.models.frequent_environments_by_group, {
-                group.id: {
-                    environment.id: 1,
-                },
-            })
-        ]
-
-        if release:
-            frequencies.append(
-                (tsdb.models.frequent_releases_by_group, {
-                    group.id: {
-                        grouprelease.id: 1,
-                    },
-                })
-            )
-
-        tsdb.record_frequency_multi(frequencies, timestamp=event.datetime)
-
-        UserReport.objects.filter(
-            project=project,
-            event_id=event_id,
-        ).update(
-            group=group,
-            environment=environment,
-        )
-
-        # save the event unless its been sampled
-        if not is_sample:
-            try:
-                with transaction.atomic(using=router.db_for_write(Event)):
-                    event.save()
-            except IntegrityError:
-                self.logger.info(
-                    'duplicate.found',
-                    exc_info=True,
-                    extra={
-                        'event_uuid': event_id,
-                        'project_id': project.id,
-                        'group_id': group.id,
-                        'model': Event.__name__,
-                    }
-                )
-                return event
-
-            index_event_tags.delay(
-                organization_id=project.organization_id,
-                project_id=project.id,
-                group_id=group.id,
-                environment_id=environment.id,
-                event_id=event.id,
-                tags=tags,
-                date_added=event.datetime,
-            )
-
-        if event_user:
-            tsdb.record_multi(
-                (
-                    (tsdb.models.users_affected_by_group, group.id, (event_user.tag_value, )),
-                    (tsdb.models.users_affected_by_project, project.id, (event_user.tag_value, )),
-                ),
-                timestamp=event.datetime,
-                environment_id=environment.id,
-            )
-        if release:
-            if is_new:
-                buffer.incr(
-                    ReleaseProject, {'new_groups': 1}, {
-                        'release_id': release.id,
-                        'project_id': project.id,
-                    }
-                )
-            if is_new_group_environment:
-                buffer.incr(
-                    ReleaseProjectEnvironment, {'new_issues_count': 1}, {
-                        'project_id': project.id,
-                        'release_id': release.id,
-                        'environment_id': environment.id,
-                    }
-                )
-
-        safe_execute(Group.objects.add_tags, group, environment, tags, _with_transaction=False)
-
         if not raw:
             if not project.first_event:
                 project.update(first_event=date)
-                first_event_received.send(project=project, group=group, sender=Project)
-
-            post_process_group.delay(
-                group=group,
-                event=event,
-                is_new=is_new,
-                is_sample=is_sample,
-                is_regression=is_regression,
-                is_new_group_environment=is_new_group_environment,
-                primary_hash=hashes[0],
-            )
-        else:
-            self.logger.info('post_process.skip.raw_event', extra={'event_id': event.id})
-
-        metrics.timing(
-            'events.latency',
-            received_timestamp - recorded_timestamp,
-            tags={
-                'project_id': project.id,
-            },
-        )
-
-        return event
+        return event, tags, EventMapping(project=project, group=group, event_id=event_id), environment
 
     def _get_event_user(self, project, data):
         user_data = data.get('sentry.interfaces.User')
@@ -1016,6 +975,16 @@ class EventManager(object):
         return euser
 
     def _find_hashes(self, project, hash_list):
+        if len(hash_list) == 1:
+            try:
+                hash_obj = GroupHash(
+                    project=project,
+                    hash=hash_list[0],
+                )
+                hash_obj.save()
+            except IntegrityError:
+                hash_obj = GroupHash.objects.get_from_cache(project=project, hash=hash_list[0])
+            return [hash_obj]
         return map(
             lambda hash: GroupHash.objects.get_or_create(
                 project=project,
@@ -1094,7 +1063,7 @@ class EventManager(object):
             )
 
         else:
-            group = Group.objects.get(id=existing_group_id)
+            group = Group.objects.get_from_cache(id=existing_group_id)
 
             group_is_new = False
 

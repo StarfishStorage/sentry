@@ -172,18 +172,12 @@ class RedisBuffer(Buffer):
                     for key in keys:
                         pending_buffer.append(key)
                         if pending_buffer.full():
-                            process_incr.apply_async(
-                                kwargs={
-                                    'batch_keys': pending_buffer.flush(),
-                                }
-                            )
+                            process_incr(batch_keys=pending_buffer.flush())
                     conn.target([host_id]).zrem(pending_key, *keys)
 
             # queue up remainder of pending keys
             if not pending_buffer.empty():
-                process_incr.apply_async(kwargs={
-                    'batch_keys': pending_buffer.flush(),
-                })
+                process_incr(batch_keys=pending_buffer.flush())
 
             metrics.timing('buffer.pending-size', keycount)
         finally:

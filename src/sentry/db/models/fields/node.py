@@ -141,6 +141,7 @@ class NodeField(GzippedDictField):
         elif not value:
             value = {}
 
+        return NodeData(self, None, value)
         if 'node_id' in value:
             node_id = value.pop('node_id')
             data = None
@@ -155,14 +156,7 @@ class NodeField(GzippedDictField):
             # save ourselves some storage
             return None
 
-        # TODO(dcramer): we should probably do this more intelligently
-        # and manually
-        if not value.id:
-            value.id = nodestore.create(value.data)
-        else:
-            nodestore.set(value.id, value.data)
-
-        return compress(pickle.dumps({'node_id': value.id}))
+        return compress(pickle.dumps(value.data))
 
 
 if hasattr(models, 'SubfieldBase'):

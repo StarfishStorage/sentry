@@ -252,9 +252,7 @@ INSTALLED_APPS = (
     'django.contrib.staticfiles', 'crispy_forms', 'debug_toolbar',
     'raven.contrib.django.raven_compat', 'rest_framework', 'sentry', 'sentry.analytics',
     'sentry.analytics.events', 'sentry.nodestore', 'sentry.search', 'sentry.lang.java',
-    'sentry.lang.javascript', 'sentry.lang.native', 'sentry.plugins.sentry_interface_types',
-    'sentry.plugins.sentry_mail', 'sentry.plugins.sentry_urls', 'sentry.plugins.sentry_useragents',
-    'sentry.plugins.sentry_webhooks', 'social_auth', 'sudo', 'sentry.tagstore',
+    'sentry.lang.javascript', 'sentry.lang.native', 'social_auth', 'sudo', 'sentry.tagstore',
 )
 
 import django

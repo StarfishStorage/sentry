@@ -277,7 +277,6 @@ class ClientApiHelper(object):
             if isinstance(json_string, six.binary_type):
                 json_string = json_string.decode('utf-8')
             obj = json.loads(json_string)
-            assert isinstance(obj, dict)
         except Exception as e:
             # This error should be caught as it suggests that there's a
             # bug somewhere in the client's code.
@@ -348,17 +347,19 @@ class ClientApiHelper(object):
             data['sdk'].pop('client_ip', None)
 
     def insert_data_to_database(self, data, start_time=None, from_reprocessing=False):
+        task = from_reprocessing and \
+            preprocess_event_from_reprocessing or preprocess_event
         if start_time is None:
             start_time = time()
         # we might be passed LazyData
         if isinstance(data, LazyData):
-            data = dict(data.items())
-        cache_key = 'e:{1}:{0}'.format(data['project'], data['event_id'])
+            data = list(data)
+        if not isinstance(data, list):
+            data = [data]
+        first_item = data[0]
+        cache_key = 'e:{1}:{0}'.format(first_item['project'], first_item['event_id'])
         default_cache.set(cache_key, data, timeout=3600)
-        task = from_reprocessing and \
-            preprocess_event_from_reprocessing or preprocess_event
-        task.delay(cache_key=cache_key, start_time=start_time,
-                   event_id=data['event_id'])
+        task.delay(cache_key=cache_key, start_time=start_time, event_id=None)
 
 
 class MinidumpApiHelper(ClientApiHelper):
@@ -494,6 +495,17 @@ class LazyData(MutableMapping):
         # version of the data
 
         # mutates data
+        processed_data = []
+        if isinstance(data, list):
+            for item in data:
+                processed_data.append(self._process_item(auth, item, helper, self._project))
+        else:
+            processed_data = [self._process_item(auth, data, helper, self._project)]
+
+        self._data = processed_data
+        self._decoded = True
+
+    def _process_item(self, auth, data, helper, project):
         data = helper.validate_data(data)
 
         data['project'] = self._project.id
@@ -506,9 +518,7 @@ class LazyData(MutableMapping):
             'client_ip': self._client_ip,
             'auth': self._auth,
         })
-
-        self._data = data
-        self._decoded = True
+        return data
 
     def __getitem__(self, name):
         if not self._decoded:

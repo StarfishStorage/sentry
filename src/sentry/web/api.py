@@ -8,10 +8,12 @@ import logging
 import os
 import six
 import traceback
+from time import time
 import uuid
 
-from time import time
+from redis import StrictRedis
 
+from collections import defaultdict
 from django.conf import settings
 from django.contrib.auth.models import AnonymousUser
 from django.core.cache import cache
@@ -26,9 +28,12 @@ from django.views.generic.base import View as BaseView
 from functools import wraps
 from querystring_parser import parser
 from raven.contrib.django.models import client as Raven
+from rest_framework import permissions
+
 from symbolic import ProcessMinidumpError
 
 from sentry import quotas, tsdb
+from sentry.api.base import Endpoint
 from sentry.coreapi import (
     APIError, APIForbidden, APIRateLimited, ClientApiHelper, SecurityApiHelper, LazyData,
     MinidumpApiHelper,
@@ -263,6 +268,22 @@ class APIView(BaseView):
         return response
 
 
+class ProgressView(Endpoint):
+
+    permission_classes = (permissions.IsAuthenticated, )
+
+    def get(self, request, key):
+        redis_db = StrictRedis.from_url(settings.BROKER_URL)
+        sent = redis_db.hget('sent', key)
+        loaded = redis_db.hget('loaded', key)
+        return HttpResponse(
+            json.dumps({
+                'sent': sent,
+                'loaded': loaded,
+            }), content_type='application/json'
+        )
+
+
 class StoreView(APIView):
     """
     The primary endpoint for storing new events.
@@ -329,15 +350,16 @@ class StoreView(APIView):
         return response
 
     def process(self, request, project, key, auth, helper, data, **kwargs):
+        redis_db = StrictRedis.from_url(settings.BROKER_URL)
         metrics.incr('events.total')
-
-        if not data:
+        data_list = data
+        if not data_list:
             raise APIError('No JSON data was found')
 
         remote_addr = request.META['REMOTE_ADDR']
 
-        data = LazyData(
-            data=data,
+        data_list = LazyData(
+            data=data_list,
             content_encoding=request.META.get('HTTP_CONTENT_ENCODING', ''),
             helper=helper,
             project=project,
@@ -353,81 +375,14 @@ class StoreView(APIView):
         )
         start_time = time()
         tsdb_start_time = to_datetime(start_time)
-        should_filter, filter_reason = helper.should_filter(
-            project, data, ip_address=remote_addr)
-        if should_filter:
-            increment_list = [
-                (tsdb.models.project_total_received, project.id),
-                (tsdb.models.project_total_blacklisted, project.id),
-                (tsdb.models.organization_total_received,
-                 project.organization_id),
-                (tsdb.models.organization_total_blacklisted,
-                 project.organization_id),
-                (tsdb.models.key_total_received, key.id),
-                (tsdb.models.key_total_blacklisted, key.id),
-            ]
-            try:
-                increment_list.append(
-                    (FILTER_STAT_KEYS_TO_VALUES[filter_reason], project.id))
-            # should error when filter_reason does not match a key in FILTER_STAT_KEYS_TO_VALUES
-            except KeyError:
-                pass
+        events_ids = []
 
-            tsdb.incr_multi(
-                increment_list,
-                timestamp=tsdb_start_time,
-            )
+        inc_keys = defaultdict(int)
+        for data in data_list:
+            event_id = data['event_id']
+            if 'counter' in data['extra']:
+                inc_keys[data['extra']['counter'].strip("'")] += 1
 
-            metrics.incr('events.blacklisted', tags={
-                         'reason': filter_reason})
-            event_filtered.send_robust(
-                ip=remote_addr,
-                project=project,
-                sender=type(self),
-            )
-            raise APIForbidden('Event dropped due to filter: %s' % (filter_reason,))
-
-        # TODO: improve this API (e.g. make RateLimit act on __ne__)
-        rate_limit = safe_execute(
-            quotas.is_rate_limited, project=project, key=key, _with_transaction=False
-        )
-        if isinstance(rate_limit, bool):
-            rate_limit = RateLimit(is_limited=rate_limit, retry_after=None)
-
-        # XXX(dcramer): when the rate limiter fails we drop events to ensure
-        # it cannot cascade
-        if rate_limit is None or rate_limit.is_limited:
-            if rate_limit is None:
-                helper.log.debug(
-                    'Dropped event due to error with rate limiter')
-            tsdb.incr_multi(
-                [
-                    (tsdb.models.project_total_received, project.id),
-                    (tsdb.models.project_total_rejected, project.id),
-                    (tsdb.models.organization_total_received,
-                     project.organization_id),
-                    (tsdb.models.organization_total_rejected,
-                     project.organization_id),
-                    (tsdb.models.key_total_received, key.id),
-                    (tsdb.models.key_total_rejected, key.id),
-                ],
-                timestamp=tsdb_start_time,
-            )
-            metrics.incr(
-                'events.dropped',
-                tags={
-                    'reason': rate_limit.reason_code if rate_limit else 'unknown',
-                }
-            )
-            event_dropped.send_robust(
-                ip=remote_addr,
-                project=project,
-                sender=type(self),
-                reason_code=rate_limit.reason_code if rate_limit else None,
-            )
-            if rate_limit is not None:
-                raise APIRateLimited(rate_limit.retry_after)
-        else:
             tsdb.incr_multi(
                 [
                     (tsdb.models.project_total_received, project.id),
@@ -438,66 +393,36 @@ class StoreView(APIView):
                 timestamp=tsdb_start_time,
             )
 
-        org_options = OrganizationOption.objects.get_all_values(
-            project.organization_id)
+            # TODO(dcramer): ideally we'd only validate this if the event_id was
+            # supplied by the user
+            cache_key = 'ev:%s:%s' % (project.id, event_id, )
+            cache.set(cache_key, '', 60 * 5)
 
-        event_id = data['event_id']
+            if cache.get(cache_key) is not None:
+                raise APIForbidden(
+                    'An event with the same ID already exists (%s)' % (event_id, ))
 
-        # TODO(dcramer): ideally we'd only validate this if the event_id was
-        # supplied by the user
-        cache_key = 'ev:%s:%s' % (project.id, event_id, )
+            # mutates data (strips a lot of context if not queued)
 
-        if cache.get(cache_key) is not None:
-            raise APIForbidden(
-                'An event with the same ID already exists (%s)' % (event_id, ))
+        for key, value in inc_keys.items():
+            redis_db.hincrby("sent", key, value)
 
-        scrub_ip_address = (org_options.get('sentry:require_scrub_ip_address', False) or
-                            project.get_option('sentry:scrub_ip_address', False))
-        scrub_data = (org_options.get('sentry:require_scrub_data', False) or
-                      project.get_option('sentry:scrub_data', True))
+        helper.insert_data_to_database(data_list, start_time=start_time)
 
-        if scrub_data:
-            # We filter data immediately before it ever gets into the queue
-            sensitive_fields_key = 'sentry:sensitive_fields'
-            sensitive_fields = (
-                org_options.get(sensitive_fields_key, []) +
-                project.get_option(sensitive_fields_key, [])
+        for data in data_list:
+            event_id = data['event_id']
+
+            helper.log.debug('New event received (%s)', event_id)
+
+            event_accepted.send_robust(
+                ip=remote_addr,
+                data=data,
+                project=project,
+                sender=type(self),
             )
+            events_ids.append(event_id)
 
-            exclude_fields_key = 'sentry:safe_fields'
-            exclude_fields = (
-                org_options.get(exclude_fields_key, []) +
-                project.get_option(exclude_fields_key, [])
-            )
-
-            scrub_defaults = (org_options.get('sentry:require_scrub_defaults', False) or
-                              project.get_option('sentry:scrub_defaults', True))
-
-            SensitiveDataFilter(
-                fields=sensitive_fields,
-                include_defaults=scrub_defaults,
-                exclude_fields=exclude_fields,
-            ).apply(data)
-
-        if scrub_ip_address:
-            # We filter data immediately before it ever gets into the queue
-            helper.ensure_does_not_have_ip(data)
-
-        # mutates data (strips a lot of context if not queued)
-        helper.insert_data_to_database(data, start_time=start_time)
-
-        cache.set(cache_key, '', 60 * 5)
-
-        helper.log.debug('New event received (%s)', event_id)
-
-        event_accepted.send_robust(
-            ip=remote_addr,
-            data=data,
-            project=project,
-            sender=type(self),
-        )
-
-        return event_id
+        return events_ids
 
 
 class MinidumpView(StoreView):

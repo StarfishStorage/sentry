@@ -12,6 +12,7 @@ from datetime import timedelta
 from uuid import uuid4
 
 import click
+from django.core.exceptions import FieldError
 from django.utils import timezone
 
 from sentry.runner.decorators import configuration, log_options
@@ -81,7 +82,7 @@ def cleanup_chunk(days, project_id, model, dtfield, order_by, num_shards, shard_
         t.join()
 
 
-def create_deletion_task(days, project_id, model, dtfield, order_by):
+def create_deletion_task(days, project_id, model, dtfield, order_by, group):
     from sentry import models
     from sentry import deletions
     from sentry import similarity
@@ -95,6 +96,13 @@ def create_deletion_task(days, project_id, model, dtfield, order_by):
             query['project'] = project_id
         else:
             query['project_id'] = project_id
+
+    if group:
+        fields = model._meta.get_all_field_names()
+        if 'group' in fields or 'group_id' in fields:
+            query['group_id'] = group
+        if model is models.Group:
+            query['id'] = group
 
     skip_models = [
         # Handled by other parts of cleanup
@@ -154,9 +162,10 @@ def _chunk_until_complete(task, num_shards=None, shard_id=None):
     is_flag=True,
     help='Send the duration of this command to internal metrics.'
 )
+@click.option('--group', multiple=False, type=int, help='Issue (group) id to filter')
 @log_options()
 @configuration
-def cleanup(days, project, concurrency, max_procs, silent, model, router, timed):
+def cleanup(days, project, concurrency, max_procs, silent, model, router, timed, group):
     """Delete a portion of trailing data based on creation date.
 
     All data that is older than `--days` will be deleted.  The default for
@@ -178,6 +187,9 @@ def cleanup(days, project, concurrency, max_procs, silent, model, router, timed)
     from sentry.app import nodestore
     from sentry.db.deletion import BulkDeleteQuery
     from sentry import models
+
+    if concurrency > 1:
+        raise Exception("concurrency is not supported")
 
     if timed:
         import time
@@ -275,6 +287,7 @@ def cleanup(days, project, concurrency, max_procs, silent, model, router, timed)
                 days=days,
                 project_id=project_id,
                 order_by=order_by,
+                group_id=group
             ).execute(chunk_size=chunk_size)
 
     for model, dtfield, order_by in DELETES:
@@ -326,7 +339,7 @@ def cleanup(days, project, concurrency, max_procs, silent, model, router, timed)
 
             else:
                 task = create_deletion_task(
-                    days, project_id, model, dtfield, order_by)
+                    days, project_id, model, dtfield, order_by, group)
                 _chunk_until_complete(task)
 
     # Clean up FileBlob instances which are no longer used and aren't super
